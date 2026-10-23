@@ -1,23 +1,39 @@
-# Asystom LoRaWAN Codec
+# Asystom Sentinel LoRaWAN codec
 
-This repository provides a basic LoRaWAN codec for Asystom Sentinel devices. It complies with the LoRaWAN Codec API Specification version 1.0.0.
-It has been successfully tested on both Loriot and Actility LNS environments.
+This repository provides an example uplink decoder for Asystom Sentinel devices,
+using the LoRaWAN Codec API Specification version 1.0.0 interface.
 
-![Alt text](./screenshot-sentinel-codec.png)
+## Usage
 
-## Functionalities
+Load `asystom_sentinel_codec.js` into your LoRaWAN Network Server's codec editor.
+The `decodeUplink(input)` function takes the received payload in `input.bytes`,
+the LoRaWAN port in `input.fPort`, and an optional reception time in
+`input.recvTime`. It returns decoded `data`, an `errors` array, and a `warnings`
+array.
 
-This codec supports uplink data frames and system status frames (frames that are issued by a Sentinel device at startup time and that contain a description of the device configuration).
+See the [Sentinel protocol reference](doc/sentinel_protocol.md) for payload
+layouts, units, and decoded output fields.
 
-FFT zoom frames cannot be supported as a standard LNS does not provide a context to register past frames, which are necessary to decode FFT zoom frames. For the same reason, split frames (frames that span over several LoRaWAN transmissions due to a low data rate) cannot be supported.
+## Supported data
 
-However, the codec includes some functions to handle split frames, as some LNS environments provide proprietary extensions allowing to memorize data between subsequent calls to codec functions. This feature may be used in the future to provide support for split frames as well as FFT zoom frames.
+* Scalar measurements: battery level, current loop, and temperature.
+* Vibration and configurable-spectrum signatures.
+* System-status reports, including device settings and diagnostic information.
 
-Encoding of downlink commands is not supported yet but will be in the future.
+FFT zoom values require settings retained from earlier status reports and are
+not decoded by this stateless codec. Split-frame helpers require the runtime to
+preserve state between calls; standard LNS runtimes do not guarantee this.
+For FFT zoom decoding and persistent per-device state, use the
+`asystom-sentinel-full-fledged-codec` example.
 
-## Learn More
+Downlink encoding and decoding are not implemented.
 
-The "doc" subdirectory contains two documents that describe the format of Sentinel frames.
-It also includes a subdirectory "jsdoc" that provides some basic information on the codec interface.
+## Tests
 
-You can learn more on the LoRaWAN Codec API Specification at this address : [LoRaWAN Codec API Specification 1.0.0](https://resources.lora-alliance.org/technical-specifications/ts013-1-0-0-payload-codec-api)
+Run `node --test test/sentinel_codec.test.js` with Node.js 18 or later.
+No additional dependencies or network access are required.
+
+## LoRaWAN codec interface
+
+See the [LoRaWAN Codec API Specification 1.0.0](https://resources.lora-alliance.org/technical-specifications/ts013-1-0-0-payload-codec-api)
+for the standard codec interface.

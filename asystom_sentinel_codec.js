@@ -32,26 +32,20 @@ const RPM = "rpm";
 const BATTERY_LEVEL_IDENTIFIER = 0x00;
 const CURRENT_LOOP_IDENTIFIER = 0x01;
 const TEMPERATURE_IDENTIFIER = 0x0e;
-const HUMIDITY_IDENTIFIER = 0x02;
 
 // Vector type identifiers
-const SHOCK_DETECTION_VECTOR = 0x0a;
 const SIGNATURE_VECTOR = 0x0b;
-const SIGNATURE_REFEFENCE = 0x0c;
 const SIGNATURE_EXTENSIONS = 0x0d;
 const SYSTEM_STATUS_REPORT = 0xff;
 
 const VECTOR_TYPES = [
-    SHOCK_DETECTION_VECTOR,
+
     SIGNATURE_VECTOR,
-    SIGNATURE_REFEFENCE,
+
     SIGNATURE_EXTENSIONS,
     SYSTEM_STATUS_REPORT
 ];
 
-const SCHEDULING_PERIOD_SCALE_FACTOR = 10;
-const SONIC_FREQUENCY_SCALE_FACTOR = 10;
-const RPM_SCALE_FACTOR = 60;
 
 // State variable
 let inputData;
@@ -59,25 +53,230 @@ let decodeResult;
 let globalFrame;
 let globalView;
 let elementCount;
-let _segmentedFrame;
+let _segmentedFrame = null;
 
 
-// Determine host endianness
-const littleEndian = (() => {
-    const buffer = new ArrayBuffer(2);
-    new DataView(buffer).setInt16(0, 256, true /* littleEndian */);
-    // Int16Array uses the platform's endianness.
-    return new Int16Array(buffer)[0] === 256;
-})();
+// Sentinel wire values are always little endian, independent of the host.
+const littleEndian = true;
 
+// BEGIN SENTINEL SETTINGS
+const sentinel_settings_layout = {
+    statusHeader: 9, scheduling: 10, measurement: 32, radio: 6, extension: 26
+};
+const sentinel_sensor_bits = [
+    [1, 'InternalAccelerometer'], [2, 'ExternalAccelerometer'],
+    [4, 'InternalMicrophone'], [8, 'ExternalMicrophone'],
+    [16, 'WeatherSensor'], [32, 'ShockDetection'], [64, 'RtdSensor'], [128, 'TcSensor']
+];
+const sentinel_orientation_bits = [[1, 'XPreferred'], [2, 'YPreferred'], [4, 'ZPreferred']];
+const sentinel_indicators = {
+    0: 'Battery level', 1: 'Current loop', 3: 'Magnet', 8: 'Wake-on event',
+    11: 'Signature', 13: 'Signature extension', 14: 'Temperature',
+    20: 'System check', 21: 'Settings reader'
+};
+const sentinel_woe_modes = [
+    'WoeInactive', 'WoeMotionTrig', 'WoeMotionTrigAuto',
+    'WoeSchedulerTrig', 'WoeAnalogTrig', 'WoeContactTrig'
+];
+const sentinel_woe_profiles = ['WoeLowPower', 'WoeMidPower1', 'WoeMidPower2', 'WoeHighPower'];
+const sentinel_spectrum_types = [
+    'UndefinedSpectrum', 'SpectrumRMS', 'SpectrumPeak', 'VelocitySpectrumRMS',
+    'VelocitySpectrumPeak', 'EnvelopeSpectrumRMS', 'EnvelopeSpectrumPeak'
+];
+const sentinel_radio_status = [
+    'LoRaWAN Ok', 'LoRaWAN unknown unsolicited reception', 'LoRaWAN invalid double data length',
+    'LoRaWAN unknown transmission error', 'LoRaWAN pending transmission',
+    'LoRaWAN link check failed', 'LoRaWAN consecutive unsolicited message missed',
+    'LoRaWAN invalid parameter received', 'LoRaWAN modem wakeup failed',
+    'LoRaWAN data rate too low', 'LoRaWAN CM0 start failed', 'LoRaWAN fatal error'
+];
 
-// Convert a byte array into a hex string
-function toHexString(byteArray) {
-    return Array.from(byteArray, function(byte) {
-        return ('0' + (byte & 0xFF).toString(16)).slice(-2);
-    }).join('')
+function sentinel_view(bytes, size, name) {
+    if (bytes.length !== size) {
+        throw new RangeError(`Invalid Sentinel ${name} length: expected ${size}, received ${bytes.length}`);
+    }
+    const array = Uint8Array.from(bytes);
+    return new DataView(array.buffer);
 }
 
+function sentinel_hex(bytes) {
+    return Array.from(bytes, byte => ('0' + byte.toString(16)).slice(-2)).join('');
+}
+
+function sentinel_mask_names(mask, bits, empty) {
+    const names = bits.filter(entry => (mask & entry[0]) !== 0).map(entry => entry[1]);
+    return names.length === 0 ? [empty] : names;
+}
+
+function sentinel_enum(value, names, field) {
+    if (names[value] === undefined) {
+        throw new RangeError(`Unknown Sentinel ${field} (${value})`);
+    }
+    return names[value];
+}
+
+function sentinel_decode_firmware_status(versionHealth, radioStatus, resetSources) {
+    // Two separate status bytes are followed by a big-endian reset mask.
+    // Version-health bits indicate compatibility errors, not flashing results.
+    const resetBits = [
+        [0x0002, 'Low Voltage Detect Reset'], [0x0010, 'Option Byte Loader Reset'],
+        [0x0020, 'Watchdog'], [0x0040, 'External Reset Pin'],
+        [0x0080, 'Power On Reset'], [0x0400, 'Software - SYSRESETREQ bit']
+    ];
+    return {
+        versionHealth,
+        mainRadiosVersionError: (versionHealth & 1) !== 0,
+        sensorVersionError: (versionHealth & 2) !== 0,
+        reservedVersionHealth: versionHealth & 0xfc,
+        radioStatus,
+        softwareStatus: sentinel_radio_status[radioStatus] || `Unknown LoRaWAN status (${radioStatus})`,
+        resetSources,
+        lastBootCauses: resetBits.filter(entry => (resetSources & entry[0]) !== 0).map(entry => entry[1]),
+        reservedResetSources: resetSources & ~0x04f2
+    };
+}
+
+function sentinel_decode_scheduling_settings(bytes) {
+    const view = sentinel_view(bytes, sentinel_settings_layout.scheduling, 'scheduling settings');
+    const mask = view.getUint32(0, true);
+    const activeIndicators = Object.keys(sentinel_indicators)
+        .filter(bit => (mask & (1 << Number(bit))) !== 0).map(bit => sentinel_indicators[bit]);
+    const knownMask = Object.keys(sentinel_indicators).reduce((result, bit) => result | (1 << Number(bit)), 0);
+    return {
+        activationBitmask: sentinel_hex(bytes.slice(0, 4)),
+        activationMask: mask,
+        activeIndicators,
+        reservedActivationMask: (mask & ~knownMask) >>> 0,
+        // Scheduling periods use 10 seconds per LSB.
+        ambientPeriodicity: view.getUint16(4, true) * 10,
+        predictionPeriodicity: view.getUint16(6, true) * 10,
+        introspectionPeriodicity: view.getUint16(8, true) * 10
+    };
+}
+
+function sentinel_decode_advanced_settings(bytes) {
+    const view = sentinel_view(bytes, sentinel_settings_layout.measurement + sentinel_settings_layout.radio, 'advanced settings');
+    const sensorMask = view.getUint8(0);
+    const orientationMask = view.getUint32(0, true) >>> 8;
+    const woe = view.getUint32(24, true);
+    const mode = woe & 15;
+    const profile = (woe >>> 16) & 3;
+    const flags = view.getUint16(32, true);
+    const spectrumType = view.getUint16(20, true);
+    return {
+        sensorInformationBitmask: sentinel_hex(bytes.slice(0, 4)),
+        sensorInformation: {
+            mask: sensorMask,
+            enumeration: sentinel_mask_names(sensorMask, sentinel_sensor_bits, 'NoSensor'),
+            orientationMask,
+            orientation: sentinel_mask_names(orientationMask, sentinel_orientation_bits, 'NoOrientation'),
+            reservedOrientationMask: orientationMask & ~7
+        },
+        frequencies: {
+            sonicFrequencyHigh: view.getUint16(4, true) * 10,
+            sonicFrequencyLow: view.getUint16(6, true) * 10,
+            vibrationFrequencyHigh: view.getUint16(8, true),
+            vibrationFrequencyLow: view.getUint16(10, true)
+        },
+        rotationSpeedBoundaries: {
+            rpmUpperBoundary: view.getUint16(12, true) * 60,
+            rpmLowerBoundary: view.getUint16(14, true) * 60
+        },
+        reserved0: view.getUint16(16, true),
+        reserved1: view.getUint16(18, true),
+        customSpectrumType: spectrumType,
+        customSpectrumTypeString: sentinel_enum(spectrumType, sentinel_spectrum_types, 'custom spectrum type'),
+        customSpectrumParam: view.getUint16(22, true),
+        woeBitmask: sentinel_hex(bytes.slice(24, 28)),
+        wakeOnEventInformation: {
+            woeMode: mode,
+            woeModeString: sentinel_enum(mode, sentinel_woe_modes, 'Wake-On-Event mode'),
+            woeFlag: (woe & 16) !== 0,
+            woeParam: (woe >>> 5) & 0x7ff,
+            woeProfile: profile,
+            woeProfileString: sentinel_woe_profiles[profile],
+            woeThreshold: woe >>> 18,
+            woePretrigThreshold: view.getUint16(28, true),
+            woePostrigThreshold: view.getUint16(30, true)
+        },
+        lorawanConfig: {
+            adrIsEnabled: (flags & 1) !== 0,
+            transmissionIsAcked: (flags & 2) !== 0,
+            networkIsPrivate: (flags & 4) !== 0,
+            lorawanCodingRateIsBase: (flags & 8) !== 0,
+            codingRate: (flags & 8) !== 0 ? '4/8' : '4/5',
+            dwellTimeIsOn: (flags & 16) !== 0,
+            retransmitAckTwice: (flags & 32) !== 0,
+            packetSplitIsEnabled: (flags & 64) !== 0,
+            reserved: flags >>> 7,
+            specialFrequencySettings: view.getUint16(34, true),
+            linkCheckPeriod: view.getUint16(36, true)
+        }
+    };
+}
+
+function sentinel_decode_extension_settings(bytes) {
+    const view = sentinel_view(bytes, sentinel_settings_layout.extension, 'extension settings');
+    const settings = {
+        handle: view.getUint8(0), activation: view.getUint8(1), steps: view.getUint8(2),
+        algorithm: view.getUint8(3), sensorType: view.getUint8(4),
+        accelerometerOrientation: view.getUint8(5),
+        param1: view.getUint32(6, true), param2: view.getUint32(10, true),
+        param3: view.getUint32(14, true), param4: view.getUint32(18, true),
+        param5: view.getUint32(22, true)
+    };
+    settings.activationString = sentinel_enum(settings.activation, ['Inactive', 'Periodic', 'Burst'], 'extension activation');
+    sentinel_enum(settings.algorithm, ['SpectrumZoom'], 'extension algorithm');
+    settings.sensors = sentinel_mask_names(settings.sensorType, sentinel_sensor_bits, 'NoSensor');
+    settings.orientations = sentinel_mask_names(settings.accelerometerOrientation, sentinel_orientation_bits, 'NoOrientation');
+    settings.reservedOrientationMask = settings.accelerometerOrientation & ~7;
+    // Spectrum-zoom parameters: frequency limits, compression, type and cutoff.
+    settings.upperFrequency = settings.param1;
+    settings.lowerFrequency = settings.param2;
+    settings.compressionType = settings.param3;
+    sentinel_enum(settings.compressionType, [0, 1, 2, 3, 4], 'FFT zoom compression');
+    settings.spectrumType = settings.param4;
+    settings.spectrumTypeString = sentinel_enum(settings.spectrumType, sentinel_spectrum_types, 'extension spectrum type');
+    settings.cutOffFrequency = settings.param5;
+    return settings;
+}
+
+function sentinel_decode_system_status(bytes) {
+    const size = sentinel_settings_layout.statusHeader + sentinel_settings_layout.scheduling +
+        sentinel_settings_layout.measurement + sentinel_settings_layout.radio + sentinel_settings_layout.extension;
+    const view = sentinel_view(bytes, size, 'system status');
+    const schedulingOffset = sentinel_settings_layout.statusHeader;
+    const advancedOffset = schedulingOffset + sentinel_settings_layout.scheduling;
+    const extensionOffset = advancedOffset + sentinel_settings_layout.measurement + sentinel_settings_layout.radio;
+    const schedulingSettings = sentinel_decode_scheduling_settings(bytes.slice(schedulingOffset, advancedOffset));
+    return {
+        firmwareStatus: sentinel_decode_firmware_status(view.getUint8(0), view.getUint8(1), view.getUint16(2, false)),
+        firmwareVersion: String.fromCharCode(...bytes.slice(4, 9)),
+        schedulingSettings,
+        activationStatus: schedulingSettings.activeIndicators.map(name => `${name} scheduling is active`),
+        advancedSettings: sentinel_decode_advanced_settings(bytes.slice(advancedOffset, extensionOffset)),
+        extensionSettings: sentinel_decode_extension_settings(bytes.slice(extensionOffset))
+    };
+}
+
+function sentinel_decode_cached_extension_settings(cached) {
+    // Revalidate persisted values using the same wire parser as a fresh status.
+    const fields = ['handle', 'activation', 'steps', 'algorithm', 'sensorType',
+        'accelerometerOrientation', 'param1', 'param2', 'param3', 'param4', 'param5'];
+    const bytes = new Uint8Array(sentinel_settings_layout.extension);
+    const view = new DataView(bytes.buffer);
+    fields.forEach((field, index) => {
+        const value = cached[field];
+        const max = index < 6 ? 255 : 0xffffffff;
+        if (!Number.isInteger(value) || value < 0 || value > max) {
+            throw new RangeError(`Invalid Sentinel cached extension field ${field}`);
+        }
+        if (index < 6) view.setUint8(index, value);
+        else view.setUint32(6 + (index - 6) * 4, value, true);
+    });
+    return sentinel_decode_extension_settings(bytes);
+}
+// END SENTINEL SETTINGS
 
 // A class to represent the physical values extracted from Sentinel data frames
 class PhysicalValue {
@@ -94,16 +293,16 @@ class PhysicalValue {
         { name: "vibration_frequencyBandS7", unit: DB, value: 0.0, min: -150.0, max: 0.0 },
         { name: "vibration_frequencyBandS8", unit: DB, value: 0.0, min: -150.0, max: 0.0 },
         { name: "vibration_frequencyBandS9", unit: DB, value: 0.0, min: -150.0, max: 0.0 },
-        { name: "sound_frequencyBandS10", unit: DB, value: 0.0, min: -150.0, max: 0.0 },
-        { name: "sound_frequencyBandS11", unit: DB, value: 0.0, min: -150.0, max: 0.0 },
-        { name: "sound_frequencyBandS12", unit: DB, value: 0.0, min: -150.0, max: 0.0 },
-        { name: "sound_frequencyBandS13", unit: DB, value: 0.0, min: -150.0, max: 0.0 },
-        { name: "sound_frequencyBandS14", unit: DB, value: 0.0, min: -150.0, max: 0.0 },
-        { name: "sound_frequencyBandS15", unit: DB, value: 0.0, min: -150.0, max: 0.0 },
-        { name: "sound_frequencyBandS16", unit: DB, value: 0.0, min: -150.0, max: 0.0 },
-        { name: "sound_frequencyBandS17", unit: DB, value: 0.0, min: -150.0, max: 0.0 },
-        { name: "sound_frequencyBandS18", unit: DB, value: 0.0, min: -150.0, max: 0.0 },
-        { name: "sound_frequencyBandS19", unit: DB, value: 0.0, min: -150.0, max: 0.0 },
+        { name: "custom_frequencyBandS10", unit: DB, value: 0.0, min: -150.0, max: 0.0 },
+        { name: "custom_frequencyBandS11", unit: DB, value: 0.0, min: -150.0, max: 0.0 },
+        { name: "custom_frequencyBandS12", unit: DB, value: 0.0, min: -150.0, max: 0.0 },
+        { name: "custom_frequencyBandS13", unit: DB, value: 0.0, min: -150.0, max: 0.0 },
+        { name: "custom_frequencyBandS14", unit: DB, value: 0.0, min: -150.0, max: 0.0 },
+        { name: "custom_frequencyBandS15", unit: DB, value: 0.0, min: -150.0, max: 0.0 },
+        { name: "custom_frequencyBandS16", unit: DB, value: 0.0, min: -150.0, max: 0.0 },
+        { name: "custom_frequencyBandS17", unit: DB, value: 0.0, min: -150.0, max: 0.0 },
+        { name: "custom_frequencyBandS18", unit: DB, value: 0.0, min: -150.0, max: 0.0 },
+        { name: "custom_frequencyBandS19", unit: DB, value: 0.0, min: -150.0, max: 0.0 },
         { name: "acceleration_x", unit: G, value: 0.0, min: 0.0, max: 16.0 },
         { name: "velocity_x", unit: MmPerSecond, value: 0.0, min: 0.0, max: 100.0 },
         { name: "acceleration_x_peak", unit: G, value: 0.0, min: 0.0, max: 16.0 },
@@ -129,8 +328,8 @@ class PhysicalValue {
         { name: "velocity_z_f2", unit: MmPerSecond, value: 0.0, min: 0.0, max: 100.0 },
         { name: "velocity_z_f3", unit: MmPerSecond, value: 0.0, min: 0.0, max: 100.0 },
         { name: "temperature_machineSurface", unit: "°C", value: 0.0, min: -273.15, max: 2000.0 },
-        { name: "", unit: "", value: 0.0, min: 0.0, max: 100.0 },
-        { name: "kurtosis_ultrasound", unit: "", value: 0.0, min: 0.0, max: 1.0 },
+        { name: "vibration_custom", unit: G, value: 0.0, min: 0.0, max: 16.0 },
+        { name: "sound_custom", unit: "", value: 0.0, min: 0.0, max: 1.0 },
         { name: "sound_sonicRmslog", unit: DB, value: 0.0, min: -150.0, max: 0.0 },
         { name: "", unit: "", value: 0.0, min: 0.0, max: 65535.0 }
     ];
@@ -253,40 +452,6 @@ class SegmentedFrame {
 }
 
 
-// A class to represent the Sentinel device health
-class SentinelDeviceHealth {
-    constructor(description, value) {
-        this._description = description;
-        this._value = value;
-      }
-
-    toString() {
-        return `${this._description}`;
-    }
-
-    getValue() {
-        return this._value;
-    }
-
-    static getEnum(value) {
-        return Object.values(SentinelDeviceHealth)[value];
-    }
-
-    // Specifying the numerical value attached to each enum value is just a safety measure, in case someone would introduce new enum values in between.
-    // Indeed, these values represent the precise numerical value uplinked in a beacon data frame.
-    static LorawanOk = new SentinelDeviceHealth('LoRaWAN Ok', 0);
-    static LorawnUnknownUnsollicitedReception = new SentinelDeviceHealth('LoRaWAN unknown unsollicited reception', 1);
-    static LorawanInvalidDoubleDataLength = new SentinelDeviceHealth('LoRaWAN invalid double data length', 2);
-    static LorawanUnknownTransmissionError = new SentinelDeviceHealth('LoRaWAN unknown transmission error', 3);
-    static LorawanPendingTransmission = new SentinelDeviceHealth('LoRaWAN pending transmission', 4);
-    static LorawanLinkCheckFailed = new SentinelDeviceHealth('LoRaWAN link check failed', 5);
-    static LorawanConsecutiveUnsollicitedMessageMissed = new SentinelDeviceHealth('LoRaWAN consecutive unsollicited message missed', 6);
-    static LorawanInvalidParameterReceived = new SentinelDeviceHealth('LoRaWAN invalid parameter received', 7);
-    static LorawanModemWakeupFailed = new SentinelDeviceHealth('LoRaWAN modem wakeup failed', 8);
-    static LorawanDataRateTooLow = new SentinelDeviceHealth('LoRaWAN data rate too low', 9);
-}
-
-
 // Convert a byte array into an ArrayBuffer
 // Used to get integer values from a byte array, taking into account endianess
 function byteArrayToUint8Array(byteArray) {
@@ -296,295 +461,14 @@ function byteArrayToUint8Array(byteArray) {
 }
 
 
-// Prepare the decoding result regarding firmware status
-function extractFirmwareStatus(lastBootCausesSoftware, lastBootCausesHardware1stByte, lastBootCausesHardware2ndByte) {
-    decodeResult.data.firmwareStatus = {
-        lastBootCauses: [],
-        softwareStatus: ""
-    };
-
-    // Register HW-related boot causes
-    if ((lastBootCausesHardware2ndByte & 0x1) != 0) {
-        decodeResult.data.firmwareStatus.lastBootCauses.push("Low Leakage Wakeup");
-    }
-
-    if ((lastBootCausesHardware2ndByte & (0x1 << 1)) != 0) {
-        decodeResult.data.firmwareStatus.lastBootCauses.push("Low Voltage Detect Reset");
-    }
-
-    if ((lastBootCausesHardware2ndByte & (0x1 << 2)) != 0) {
-        decodeResult.data.firmwareStatus.lastBootCauses.push("Loss of Clock Reset");
-    }
-    
-    if ((lastBootCausesHardware2ndByte & (0x1 << 3)) != 0) {
-        decodeResult.data.firmwareStatus.lastBootCauses.push("Loss of Lock Reset");
-    }
-    
-    if ((lastBootCausesHardware2ndByte & (0x1 << 5)) != 0) {
-        decodeResult.data.firmwareStatus.lastBootCauses.push("Watchdog");
-    }
-    
-    if ((lastBootCausesHardware2ndByte & (0x1 << 6)) != 0) {
-        decodeResult.data.firmwareStatus.lastBootCauses.push("External Reset Pin");
-    }
-    
-    if ((lastBootCausesHardware2ndByte & (0x1 << 7)) != 0) {
-        decodeResult.data.firmwareStatus.lastBootCauses.push("Power On Reset");
-    }
-    
-    if ((lastBootCausesHardware1stByte & 0x1) != 0) {
-        decodeResult.data.firmwareStatus.lastBootCauses.push("Jtag Generated Reset");
-    }
-    
-    if ((lastBootCausesHardware1stByte & (0x1 << 1)) != 0) {
-        decodeResult.data.firmwareStatus.lastBootCauses.push("Core Lockup");
-    }
-    
-    if ((lastBootCausesHardware1stByte & (0x1 << 2)) != 0) {
-        decodeResult.data.firmwareStatus.lastBootCauses.push("Software - SYSRESETREQ bit");
-    }
-
-    if ((lastBootCausesHardware1stByte & (0x1 << 3)) != 0) {
-        decodeResult.data.firmwareStatus.lastBootCauses.push("MDM-AP System Reset Request");
-    }
-
-    if ((lastBootCausesHardware1stByte & (0x1 << 5)) != 0) {
-        decodeResult.data.firmwareStatus.lastBootCauses.push("Stop Mode Acknowledge Error Reset");
-    }
-
-    // Register device software-related boot causes
-    let lastBootCauseSoftwareAsEnum;
+// The status vector excludes its 0xff identifier.
+function extractSystemStatusData(vector) {
     try {
-        lastBootCauseSoftwareAsEnum = SentinelDeviceHealth.getEnum(lastBootCausesSoftware);
-        decodeResult.data.firmwareStatus.softwareStatus = lastBootCauseSoftwareAsEnum.toString();
+        Object.assign(decodeResult.data, sentinel_decode_system_status(vector));
     }
-    catch(ex) {
-        decodeResult.data.firmwareStatus.softwareStatus = ex.message;
+    catch (error) {
+        decodeResult.errors.push(error.message);
     }
-}
-
-
-// Extract public settings
-function extractSchedulingSettings(schedulingSettingsData, vectorView, indexInVector) {
-    decodeResult.data.schedulingSettings = {
-        activationBitmask: toHexString(schedulingSettingsData.slice(0, 4)),
-        ambientPeriodicity: vectorView.getInt16(indexInVector + 4, littleEndian) * SCHEDULING_PERIOD_SCALE_FACTOR,
-        predictionPeriodicity: vectorView.getInt16(indexInVector + 6, littleEndian) * SCHEDULING_PERIOD_SCALE_FACTOR,
-        introspectionPeriodicity: vectorView.getInt16(indexInVector + 8, littleEndian) * SCHEDULING_PERIOD_SCALE_FACTOR
-    };
-}
-
-
-// Store sensor-related information
-function setSensorInformation(bitmask) {
-    decodeResult.data.advancedSettings.sensorInformation = {
-        enumeration: "",
-    };
-
-    let sensorEnumeration = bitmask[0];  // 32-bit status data is stored as little endian on firmware and copied as-is
-
-    if ((sensorEnumeration & 0x3) === 0x3) {
-        decodeResult.data.advancedSettings.sensorInformation.enumeration += "AnyAccelerometer\n";
-    }
-
-    if ((sensorEnumeration & 0xc) === 0xc) {
-        decodeResult.data.advancedSettings.sensorInformation.enumeration += "AnyMicrophone";
-    }
-
-    // Only supported sensors are accelerometer and microphone
-    // If the bitfield contains nothing, then it's an error
-    if ((sensorEnumeration & 0xf) === 0) {
-        decodeResult.data.advancedSettings.sensorInformation.enumeration = "NoSensor";
-        decodeResult.warnings.push("No sensor information in frame, this is unexpected");
-    }
-
-    let sensorOrientation = bitmask[2];
-    if (sensorOrientation === 0) {
-        decodeResult.data.advancedSettings.sensorInformation.orientation = "NoOrientation";
-    }
-    else if (sensorOrientation === 1) {
-        decodeResult.data.advancedSettings.sensorInformation.orientation = "XPreferred";
-    }
-    else if (sensorOrientation === 2) {
-        decodeResult.data.advancedSettings.sensorInformation.orientation = "YPreferred";
-    }
-    else if (sensorOrientation === 4) {
-        decodeResult.data.advancedSettings.sensorInformation.orientation = "ZPreferred\n";
-    }
-}
-
-
-// Set Wake_On-Event information
-// See firmware header file utils/datamodel.h
-function setWoeInfos(woeBytes, vectorView, index) {
-    let paramsAndFlagAndMode = vectorView.getInt16(index, littleEndian);
-    let thresholdAndProfile = vectorView.getInt16(index + 2, littleEndian);
-
-    decodeResult.data.advancedSettings.wakeOnEventInformation = {
-        woeMode: paramsAndFlagAndMode & 0xF,
-        woeFlag: ((paramsAndFlagAndMode & 0x10) >> 4) === 1,
-        woeParam: (paramsAndFlagAndMode & 0xFFE0) >> 5,
-        woeProfile: thresholdAndProfile & 0x3,
-        woeThreshold: (thresholdAndProfile & 0xFFFC) >> 2,
-        woePretrigThreshold: vectorView.getInt16(index + 4, littleEndian),
-        woePostrigThreshold: vectorView.getInt16(index + 6, littleEndian),
-    }
-
-    switch(decodeResult.data.advancedSettings.wakeOnEventInformation.woeMode) {
-        case 0:
-            decodeResult.data.advancedSettings.wakeOnEventInformation.woeModeString = "WoeInactive";
-            break;
-        case 1:
-            decodeResult.data.advancedSettings.wakeOnEventInformation.woeModeString = "WoeMotionTrig";
-            break;
-        case 2:
-            decodeResult.data.advancedSettings.wakeOnEventInformation.woeModeString = "WoeMotionTrigAuto";
-            break;
-        case 3:
-            decodeResult.data.advancedSettings.wakeOnEventInformation.woeModeString = "WoeSchedulerTrig";
-            break;
-        case 4:
-            decodeResult.data.advancedSettings.wakeOnEventInformation.woeModeString = "WoeAnalogTrig";
-            break;
-        case 5:
-            decodeResult.data.advancedSettings.wakeOnEventInformation.woeModeString = "WoeContactTrig";
-            break;
-        default:
-            decodeResult.warnings.push(`Unknown Wake-On-Event mode "${decodeResult.data.advancedSettings.wakeOnEventInformation.woeMode}"`);
-            break;
-    }
-}
-
-
-// Register LoRaWAN configuration in the frame
-function setLorawanConfig(bytes, vectorView, arrayIndex, viewIndex) {
-    decodeResult.data.advancedSettings.lorawanConfig = {};
-
-    if ((bytes[arrayIndex] & 0x1) != 0) {
-        decodeResult.data.advancedSettings.lorawanConfig.adrIsEnabled = true;
-    }
-    else {
-        decodeResult.data.advancedSettings.lorawanConfig.adrIsEnabled = false;
-    }
-
-    if ((bytes[arrayIndex] & (0x1 << 1)) != 0) {
-        decodeResult.data.advancedSettings.lorawanConfig.transmissionIsAcked = true;
-    }
-    else {
-        decodeResult.data.advancedSettings.lorawanConfig.transmissionIsAcked = false;
-    }
-
-    if ((bytes[arrayIndex] & (0x1 << 2)) != 0) {
-        decodeResult.data.advancedSettings.lorawanConfig.networkIsPrivate = true;
-    }
-    else {
-        decodeResult.data.advancedSettings.lorawanConfig.networkIsPrivate = false;
-    }
-
-    if ((bytes[arrayIndex] & (0x1 << 3)) != 0) {
-        decodeResult.data.advancedSettings.lorawanConfig.lorawanCodingRateIsBase = true;
-    }
-    else {
-        decodeResult.data.advancedSettings.lorawanConfig.lorawanCodingRateIsBase = false;
-    }
-
-    if ((bytes[arrayIndex] & (0x1 << 4)) != 0) {
-        decodeResult.data.advancedSettings.lorawanConfig.dwellTimeIsOn = true;
-    }
-    else {
-        decodeResult.data.advancedSettings.lorawanConfig.dwellTimeIsOn = false;
-    }
-
-    if ((bytes[arrayIndex] & (0x1 << 5)) != 0) {
-        decodeResult.data.advancedSettings.lorawanConfig.retransmitAckTwice = true;
-    }
-    else {
-        decodeResult.data.advancedSettings.lorawanConfig.retransmitAckTwice = false;
-    }
-
-    if ((bytes[arrayIndex] & (0x1 << 6)) != 0) {
-        decodeResult.data.advancedSettings.lorawanConfig.packetSplitIsEnabled = true;
-    }
-    else {
-        decodeResult.data.advancedSettings.lorawanConfig.packetSplitIsEnabled = false;
-    }
-
-    decodeResult.data.advancedSettings.lorawanConfig.specialFrequencySettings = vectorView.getInt16(viewIndex + 2, littleEndian);
-    decodeResult.data.advancedSettings.lorawanConfig.linkCheckPeriod = vectorView.getInt16(viewIndex + 4, littleEndian);
-}
-
-
-// Extract private settings
-function extractAdvancedSettings(advancedSettingsData, vectorView, indexInVector) {
-    decodeResult.data.advancedSettings = {
-        sensorInformationBitmask: toHexString(advancedSettingsData.slice(0, 4)),
-    };
-
-    setSensorInformation(advancedSettingsData);
-
-    decodeResult.data.advancedSettings.frequencies = {
-        sonicFrequencyHigh: vectorView.getInt16(indexInVector + 4, littleEndian) * SONIC_FREQUENCY_SCALE_FACTOR,
-        sonicFrequencyLow: vectorView.getInt16(indexInVector + 6, littleEndian) * SONIC_FREQUENCY_SCALE_FACTOR,
-        vibrationFrequencyHigh: vectorView.getInt16(indexInVector + 8, littleEndian),
-        vibrationFrequencyLow: vectorView.getInt16(indexInVector + 10, littleEndian),
-    }
-
-    decodeResult.data.advancedSettings.rotationSpeedBoundaries = {
-        rpmUpperBoundary: vectorView.getInt16(indexInVector + 12, littleEndian) * RPM_SCALE_FACTOR,
-        rpmLowerBoundary: vectorView.getInt16(indexInVector + 14, littleEndian) * RPM_SCALE_FACTOR,
-    }
-
-    decodeResult.data.advancedSettings.mileageThreshold = vectorView.getInt16(indexInVector + 16, littleEndian);
-    decodeResult.data.advancedSettings.referenceCustomParam = vectorView.getInt16(indexInVector + 18, littleEndian);
-    decodeResult.data.advancedSettings.customSpectrumType = vectorView.getInt16(indexInVector + 20, littleEndian);
-    decodeResult.data.advancedSettings.customSpectrumParam = vectorView.getInt16(indexInVector + 22, littleEndian);
-    decodeResult.data.advancedSettings.woeBitmask = toHexString(advancedSettingsData.slice(24, 4));
-
-    setWoeInfos(advancedSettingsData, vectorView, indexInVector + 24);
-
-    setLorawanConfig(advancedSettingsData, vectorView, 32, indexInVector + 32);
-}
-
-
-// Extract signature settings
-function extractExtensionSettings(signatureSettings) {
-    // Not implemented in this codec version
-}
-
-
-// Extract system status data
-// The "vector" argument points to the start of the status data, i.e. the first byte following the vector type
-// Thus it points to the byte representing the data indicator and is followed by the "last boot cause" 32-bit field
-function extractSystemStatusData(vector, vectorView) {
-
-    // Prepare result data structure
-    decodeResult.data.advancedSettings = {}
-
-    // Get last boot causes (software)
-    let lastBootCausesSoftware = vectorView.getInt16(0, littleEndian);
-
-    // Get last boot causes (hardware)
-    let lastBootCausesHardware1stByte = vector[2];
-    let lastBootCausesHardware2ndByte = vector[3];
-
-    extractFirmwareStatus(lastBootCausesSoftware, lastBootCausesHardware1stByte, lastBootCausesHardware2ndByte);
-
-    // Extract the version number
-    let indexInVector = 4;    // 4 bytes for the last boot causes
-    let firmwareVersionAsBytes = vector.slice(indexInVector, indexInVector + 5);    // The firmware version is represented by 5 bytes
-    decodeResult.data.firmwareVersion = String.fromCharCode(...firmwareVersionAsBytes);
-
-    // Extract scheduling settings
-    indexInVector += 5;
-    extractSchedulingSettings(vector.slice(indexInVector, indexInVector + 10), vectorView, indexInVector);
-
-    // Extract private settings
-    indexInVector += 10;
-    extractAdvancedSettings(vector.slice(indexInVector, indexInVector + 38), vectorView, indexInVector);
-
-    // Extract signature settings
-    indexInVector += 38;
-    extractExtensionSettings(vector.slice(indexInVector));
 }
 
 
@@ -599,15 +483,11 @@ function processVectorContent(vector, vectorType, nbElements, vectorView) {
     }
 
     switch(vectorType) {
-        case SHOCK_DETECTION_VECTOR:
-            break;
 
         case SIGNATURE_VECTOR:
             decodeResult.data.signatureValues = extractSignatureValues(vectorView, nbElements);
             break;
 
-        case SIGNATURE_REFEFENCE:
-            break;
 
         case SIGNATURE_EXTENSIONS:
             decodeResult.warnings.push(`Extension frames are not yet supported`);
@@ -635,8 +515,12 @@ function buf2hex(buffer) { // buffer is an ArrayBuffer
 // The input vector argument is a Buffer
 function extractSignatureValues(vectorView, nbElements) {
     let signatureValues = [];
+    if (vectorView.byteLength !== PhysicalValue.signaturePhysicalValues.length * VECTOR_ELEMENT_VALUE_SIZE) {
+        decodeResult.errors.push('Invalid Sentinel signature length (expected 98 bytes)');
+        return signatureValues;
+    }
 
-    for (let frameIndex = 0, measurementIndex = 0; frameIndex < nbElements*VECTOR_ELEMENT_VALUE_SIZE - 2; frameIndex += VECTOR_ELEMENT_VALUE_SIZE, ++measurementIndex) {
+    for (let frameIndex = 0, measurementIndex = 0; frameIndex < nbElements*VECTOR_ELEMENT_VALUE_SIZE; frameIndex += VECTOR_ELEMENT_VALUE_SIZE, ++measurementIndex) {
 
         // Check whether architecture is little endian or not
         let valueInFrame = vectorView.getUint16(frameIndex, littleEndian);
@@ -650,7 +534,7 @@ function extractSignatureValues(vectorView, nbElements) {
 
         physicalValue = valueInFrame * (PhysicalValue.signaturePhysicalValues[measurementIndex].max - PhysicalValue.signaturePhysicalValues[measurementIndex].min) / scale + PhysicalValue.signaturePhysicalValues[measurementIndex].min;
 
-        let valueItem = PhysicalValue.signaturePhysicalValues[measurementIndex];
+        let valueItem = { ...PhysicalValue.signaturePhysicalValues[measurementIndex] };
         valueItem.value = physicalValue;
 
         signatureValues.push(valueItem);
@@ -683,12 +567,9 @@ function extractScalarValues(nbScalars) {
                 break;
             case CURRENT_LOOP_IDENTIFIER:
                 name = "Current loop";
+                unit = "mA";
                 min = 0;        
                 max = 30;
-                break;
-            case HUMIDITY_IDENTIFIER:
-                name = "Humidity";
-                unit = "% rH";
                 break;
             case TEMPERATURE_IDENTIFIER:
                 name = "Ambient temperature";
@@ -697,7 +578,7 @@ function extractScalarValues(nbScalars) {
                 max = 2000;
                 break;
             default:
-                decodeResult.warnings.push(`Unindentified scalar value indicator (${globalFrame[i]})`);
+                decodeResult.warnings.push(`Unidentified scalar value indicator (${globalFrame[i]})`);
                 valueToCompute = false;
                 break;
         }
@@ -721,6 +602,7 @@ function extractScalarValues(nbScalars) {
  * @returns {DecodedUplink} The decoded object
  */
 function decodeUplink(input) {
+    input = { ...input, bytes: Array.from(input.bytes) };
     // Prepare function output
     decodeResult = {
         data: {
@@ -734,20 +616,6 @@ function decodeUplink(input) {
     if (input.fPort > 105) {
         decodeResult.errors.push(`Invalid number of elements in frame (${input.fPort})`);
         return decodeResult;
-    }
-
-    // Get first element id
-    let elementId = input.bytes[0];
-
-    // Manage system status report from old beacons as system status report from recent ones
-    if (input.fPort === 67 && elementId === 0xFF) {
-        if (input.bytes.length === 84) {
-            input.fPort = 1;
-        }
-        else {
-            decodeResult.errors.push("Inconsistent data from frame (looks partly as a system status report)");
-            return decodeResult;
-        }
     }
 
     // Case of the first chunk of a segmented frame
@@ -794,15 +662,17 @@ function decodeUplink(input) {
     let nbScalars;
     let vectorInFrame = false;
 
+    const hasVectorType = VECTOR_TYPES.includes(inputData.bytes[(elementCount - 1) * SCALAR_VALUE_SIZE]);
+
     // Case where there is no vector
-    if (inputData.bytes.length === (elementCount * SCALAR_VALUE_SIZE)) {  // 2 characters are needed to represent a byte in hex format
+    if (!hasVectorType && inputData.bytes.length === (elementCount * SCALAR_VALUE_SIZE)) {  // 2 characters are needed to represent a byte in hex format
         nbScalars = elementCount;
     }
 
     // Possible error case
     else {
-        if (inputData.bytes.length < (elementCount * SCALAR_VALUE_SIZE)) {
-            decodeResult.errors.push(`Inconsistent number of elements in frame (${elementCount}) and frame length (${inputData.bytes.length / 2})`);
+        if (!hasVectorType && inputData.bytes.length < (elementCount * SCALAR_VALUE_SIZE)) {
+            decodeResult.errors.push(`Inconsistent number of elements in frame (${elementCount}) and frame length (${inputData.bytes.length} bytes)`);
             return decodeResult;
         }
 

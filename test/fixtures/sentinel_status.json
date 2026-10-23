@@ -1,0 +1,5 @@
+{
+  "description": "Synthetic Sentinel status (0xff + 9-byte header + 10-byte scheduling + 38-byte advanced + 26-byte extension). Boundary values exercise unsigned fields; this is not a device configuration to deploy.",
+  "fPort": 1,
+  "hex": "ff030a04f276352e30300b693080ffff00800100ff070000ffff008000800100ffff0080efbefeca0600fffff5ffffffffff0080ffff0080fffffe02ff00ff07ffffffff00000080030000000600000078563412"
+}
