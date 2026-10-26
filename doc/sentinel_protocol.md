@@ -11,6 +11,12 @@ A scalar measurement occupies three bytes: an indicator ID followed by an
 unsigned 16-bit little-endian value. A payload may contain scalars followed by
 one vector. The LoRaWAN FPort counts the scalars plus the vector, if present.
 
+Payloads containing exactly three bytes per declared element are decoded as
+scalars. Longer payloads are decoded as scalars followed by one vector; shorter
+payloads are rejected. Indicator IDs are interpreted after this classification.
+An unrecognized ID in a scalar-sized payload is reported as an unidentified
+scalar, even if its value matches a vector identifier.
+
 Vector identifiers are `0x0b` for a signature, `0x0d` for FFT zoom data, and
 `0xff` for a system-status report. A status-only uplink uses FPort 1 and is
 84 bytes long, including its identifier.
@@ -22,7 +28,8 @@ frame or an unsupported measurement.
 ## System-status report
 
 The status body after `0xff` is exactly 83 bytes. Offsets below exclude the
-identifier. Truncated or oversized status bodies return errors.
+identifier. Once a payload is identified as a status vector, a body length
+other than 83 bytes returns an error.
 
 | Offset | Bytes | Contents |
 | --- | --- | --- |

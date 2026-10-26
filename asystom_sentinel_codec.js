@@ -662,16 +662,14 @@ function decodeUplink(input) {
     let nbScalars;
     let vectorInFrame = false;
 
-    const hasVectorType = VECTOR_TYPES.includes(inputData.bytes[(elementCount - 1) * SCALAR_VALUE_SIZE]);
-
-    // Case where there is no vector
-    if (!hasVectorType && inputData.bytes.length === (elementCount * SCALAR_VALUE_SIZE)) {  // 2 characters are needed to represent a byte in hex format
+    // Classify by length before interpreting IDs: a corrupted scalar ID can match a vector ID.
+    if (inputData.bytes.length === (elementCount * SCALAR_VALUE_SIZE)) {
         nbScalars = elementCount;
     }
 
     // Possible error case
     else {
-        if (!hasVectorType && inputData.bytes.length < (elementCount * SCALAR_VALUE_SIZE)) {
+        if (inputData.bytes.length < (elementCount * SCALAR_VALUE_SIZE)) {
             decodeResult.errors.push(`Inconsistent number of elements in frame (${elementCount}) and frame length (${inputData.bytes.length} bytes)`);
             return decodeResult;
         }

@@ -1,5 +1,5 @@
 const assert = require('node:assert/strict');
-const { test } = require('node:test');
+const { sentinel_test: test, sentinel_trace_decoder } = require('./sentinel_trace');
 const fs = require('node:fs');
 const path = require('node:path');
 const vm = require('node:vm');
@@ -7,7 +7,8 @@ const vm = require('node:vm');
 // Exercise the file exactly as an LNS loads it: no require, Buffer or module.
 const context = vm.createContext({});
 vm.runInContext(fs.readFileSync(path.join(__dirname, '..', 'asystom_sentinel_codec.js'), 'utf8'), context);
-const decoders = [{ name: 'standalone LNS', decode: input => context.decodeUplink(input) }];
+const decoders = [{ name: 'standalone LNS',
+    decode: sentinel_trace_decoder('standalone LNS', input => context.decodeUplink(input)) }];
 const plain = value => JSON.parse(JSON.stringify(value));
 const fixture = Buffer.from(require('./fixtures/sentinel_status.json').hex, 'hex');
 const input = (bytes = fixture, fPort = 1, deveui = 'test-device') => ({
@@ -138,11 +139,18 @@ for (const decoder of decoders) {
         assert.equal(decode(bytes).data.firmwareStatus.softwareStatus, 'Unknown LoRaWAN status (255)');
     });
 
-    test(`${decoder.name}: reject truncated and oversized status without partial settings`, () => {
+    test(`${decoder.name}: reject invalid status lengths while preserving scalar classification`, () => {
         for (let length = 1; length < fixture.length; ++length) {
             const result = decode(fixture.subarray(0, length));
-            assert.ok(result.errors.length > 0, `length ${length}`);
-            assert.equal(result.data.extensionSettings, undefined);
+            if (length === 3) {
+                // FPort 1 and three bytes describe a scalar, even with ID 0xff.
+                assert.deepEqual(plain(result.errors), []);
+                assert.deepEqual(plain(result.warnings), ['Unidentified scalar value indicator (255)']);
+            }
+            else {
+                assert.ok(result.errors.length > 0, `length ${length}`);
+            }
+            assert.equal(result.data.extensionSettings ?? undefined, undefined);
             assert.equal(result.data.advancedSettings, undefined);
         }
         assert.ok(decode(Buffer.concat([fixture, Buffer.from([0])])).errors.length > 0);
@@ -171,6 +179,27 @@ for (const decoder of decoders) {
         const result = decode(Buffer.from([2, 0, 0]));
         assert.deepEqual(plain(result.data.scalarValues), []);
         assert.deepEqual(plain(result.warnings), ['Unidentified scalar value indicator (2)']);
+    });
+
+    test(`${decoder.name}: vector-valued scalar IDs do not change payload classification`, () => {
+        for (const id of [0x0b, 0x0d, 0xff]) {
+            for (let count = 1; count <= 3; ++count) {
+                for (let position = 0; position < count; ++position) {
+                    const bytes = Buffer.alloc(count * 3, 255);
+                    for (let index = 0; index < count; ++index) bytes[index * 3] = 14;
+                    bytes[position * 3] = id;
+                    const result = decode(bytes, count);
+                    assert.deepEqual(plain(result.errors), []);
+                    assert.deepEqual(plain(result.warnings), [`Unidentified scalar value indicator (${id})`]);
+                    assert.equal(result.data.scalarValues.length, count - 1);
+                    for (const value of result.data.scalarValues) assert.equal(value.getValue(), 2000);
+                    assert.equal(result.data.advancedSettings, undefined);
+                    assert.equal(result.data.extensionSettings ?? undefined, undefined);
+                    assert.equal(result.data.signatureValues?.length || 0, 0);
+                    assert.equal(result.data.extensionValues?.length || 0, 0);
+                }
+            }
+        }
     });
 
     test(`${decoder.name}: full Sentinel signature, custom spectrum and unsigned maxima`, () => {

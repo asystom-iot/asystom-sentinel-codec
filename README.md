@@ -30,6 +30,15 @@ Downlink encoding and decoding are not implemented.
 
 ## Tests
 
+Each decoding call displays the test name, decoder, FPort, device identifier,
+payload length, hexadecimal payload, and complete JSON decoding output. All
+signature and FFT samples are printed. Split-frame calls also show whether
+reassembly is complete. Assertions still determine whether a test passes;
+errors or warnings may be expected by a test that checks invalid input.
+
+To keep only the test summary, set the `SENTINEL_TEST_TRACE` environment variable
+to `0` before running the tests. Tracing is enabled by default.
+
 Run `node --test test/sentinel_codec.test.js` with Node.js 18 or later.
 No additional dependencies or network access are required.
 
