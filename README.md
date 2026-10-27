@@ -17,12 +17,16 @@ layouts, units, and decoded output fields.
 ## Supported data
 
 * Scalar measurements: battery level, current loop, and temperature.
-* Vibration and configurable-spectrum signatures.
-* System-status reports, including device settings and diagnostic information.
+* Standard vibration and configurable-spectrum signatures.
+* Complete system-status reports, including extension settings and diagnostic
+  information.
 
 FFT zoom values require settings retained from earlier status reports and are
-not decoded by this stateless codec. Split-frame helpers require the runtime to
-preserve state between calls; standard LNS runtimes do not guarantee this.
+not decoded by this stateless codec, even after a status report has been
+received. A transmission containing FFT zoom data is only partially decoded:
+supported scalars are returned, while FFT zoom values are omitted with a warning.
+Split-frame helpers require the runtime to preserve state between calls;
+standard LNS runtimes do not guarantee this.
 For FFT zoom decoding and persistent per-device state, use the
 `asystom-sentinel-full-fledged-codec` example.
 
@@ -32,8 +36,8 @@ Downlink encoding and decoding are not implemented.
 
 Each decoding call displays the test name, decoder, FPort, device identifier,
 payload length, hexadecimal payload, and complete JSON decoding output. All
-signature and FFT samples are printed. Split-frame calls also show whether
-reassembly is complete. Assertions still determine whether a test passes;
+decoded signature samples are printed. Assertions still determine whether a
+test passes;
 errors or warnings may be expected by a test that checks invalid input.
 
 To keep only the test summary, set the `SENTINEL_TEST_TRACE` environment variable

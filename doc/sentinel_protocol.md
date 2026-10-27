@@ -1,9 +1,9 @@
 # Sentinel protocol reference
 
 This guide describes Sentinel uplink payloads and the fields returned by the
-example codecs. Use the basic codec for stateless LNS decoding, or the
-full-fledged codec when FFT zoom decoding and persistent device settings are
-needed.
+basic LoRaWAN codec in this repository. It covers scalar measurements, standard
+signatures, and complete system-status reports. FFT zoom sample values require
+context retained between messages and are not decoded by this codec.
 
 ## Payload structure
 
@@ -19,7 +19,8 @@ scalar, even if its value matches a vector identifier.
 
 Vector identifiers are `0x0b` for a signature, `0x0d` for FFT zoom data, and
 `0xff` for a system-status report. A status-only uplink uses FPort 1 and is
-84 bytes long, including its identifier.
+84 bytes long, including its identifier. The codec recognizes `0x0d` but reports
+that extension frames are unsupported instead of decoding their FFT samples.
 
 Decoded values and settings are returned under `data`. Check `errors` before
 using a result; `warnings` describe conditions such as an incomplete split
@@ -45,6 +46,11 @@ other than 83 bytes returns an error.
 All settings integers are unsigned little endian. The reset-source mask is the
 exception shown above. Firmware information is returned under
 `data.firmwareVersion` and `data.firmwareStatus`.
+
+The complete status report is decoded, including the 26-byte extension settings
+block returned under `data.extensionSettings`. These settings describe the
+device configuration; this codec does not retain them as context for decoding
+subsequent FFT zoom frames.
 
 `mainRadiosVersionError` and `sensorVersionError` indicate version-compatibility
 errors in the controller/radios and sensor respectively. `radioStatus` is a
@@ -95,16 +101,10 @@ Offsets below are relative to this block.
 `orientationMask` preserves all 24 orientation bits, and `orientation` is an
 array of selected axes. Zero masks produce `NoSensor` and `NoOrientation`.
 
-| Sensor bit | Name |
+| Sensor field value | Name |
 | --- | --- |
-| 1 | InternalAccelerometer |
-| 2 | ExternalAccelerometer |
-| 4 | InternalMicrophone |
-| 8 | ExternalMicrophone |
-| 16 | WeatherSensor |
-| 32 | ShockDetection |
-| 64 | RtdSensor |
-| 128 | TcSensor |
+| 3 | Accelerometer |
+| 12 | Microphone |
 
 Sensor bits are combinable. Orientation bits 1, 2, and 4 select X, Y, and Z.
 Higher orientation bits are reserved and preserved as raw values. A mask value
@@ -121,42 +121,24 @@ contains the four mode/threshold bytes as hex.
 The radio coding-rate flag is 0 for 4/5 and 1 for 4/8.
 `lorawanConfig.reserved` preserves the nine reserved radio flag bits.
 
-## Extension settings and FFT zoom
+## FFT zoom limitation
 
-The 26-byte settings block is decoded under `data.extensionSettings`.
+Standard signature values are decoded under `data.signatureValues`. FFT zoom
+data needs a device's extension settings from an earlier status report to
+interpret its samples. A stateless LNS runtime does not provide the persistent
+per-device context needed for that decoding.
 
-| Offset | Type | Meaning |
-| --- | --- | --- |
-| 0-5 | uint8 each | Handle, activation, steps, algorithm, sensor mask, orientation mask |
-| 6, 10, 14, 18, 22 | uint32 each | Algorithm parameters 1-5 |
+A transmission containing FFT zoom data is therefore not fully decoded by this
+codec: any accompanying supported scalars are decoded, but FFT zoom sample
+values are omitted and a warning is returned. Receiving a status report first
+does not remove this limitation.
 
-Activation 0/1/2 means Inactive/Periodic/Burst. Algorithm 0 is SpectrumZoom.
-The five raw values are exposed as `param1`-`param5`, together with their
-interpretations: `upperFrequency` (Hz), `lowerFrequency` (Hz), `compressionType`,
-`spectrumType`, and `cutOffFrequency` (Hz). Sensor and orientation fields are
-combinable masks.
-
-| Compression | Bands | Bits per band |
-| --- | --- | --- |
-| 0 | 50 | 8 |
-| 1 | 50 | 16 |
-| 2 | 100 | 8 |
-| 3 | 100 | 16 |
-| 4 | 200 | 8 |
-
-Spectrum values 0-6 mean Undefined, RMS, Peak, Velocity RMS, Velocity Peak,
-Envelope RMS, and Envelope Peak. Unknown mode, algorithm, activation,
-compression, or spectrum values return errors. Reserved fields are preserved.
-
-The basic codec reports extension settings but does not decode FFT samples.
-The full-fledged codec uses a device's saved extension settings to decode FFT
-samples under `data.extensionValues`. Each FFT vector carries its settings
-handle in its final byte. The decoder checks that handle and the sample count
-against the saved settings.
+For FFT zoom decoding and the details of extension settings, use the
+`asystom-sentinel-full-fledged-codec` example and its protocol reference.
 
 ## Measurements
 
-Scalar IDs decoded by these examples are 0 Battery level (encoding range
+Scalar IDs decoded by this codec are 0 Battery level (encoding range
 0-100 V), 1 Current loop (0-30 mA), and 14 Temperature (-273.15 to 2000 degrees
 C). Encoding ranges describe the numeric conversion, not the operating limits
 of a sensor or device. Reserved measurement IDs are not decoded.
